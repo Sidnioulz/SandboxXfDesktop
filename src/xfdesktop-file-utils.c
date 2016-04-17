@@ -622,6 +622,7 @@ xfdesktop_file_utils_app_info_launch(GAppInfo *app_info,
     }
 
     /* launch the paths with the specified app info */
+    //TODO desktop apps, secure workspaces
     result = g_app_info_launch(app_info, files, context, error);
 
     /* check if we need to reset the working directory to the one xfdesktop was
@@ -1061,6 +1062,8 @@ xfdesktop_file_utils_launch(GFile *file,
 {
     DBusGProxy *fileman_proxy;
 
+    //TODO
+
     g_return_if_fail(G_IS_FILE(file));
     g_return_if_fail(GDK_IS_SCREEN(screen) || GTK_IS_WINDOW(parent));
 
@@ -1104,6 +1107,8 @@ xfdesktop_file_utils_execute(GFile *working_directory,
 {
     DBusGProxy *fileman_proxy;
     gboolean success = TRUE;
+
+    //TODO
 
     g_return_val_if_fail(working_directory == NULL || G_IS_FILE(working_directory), FALSE);
     g_return_val_if_fail(G_IS_FILE(file), FALSE);

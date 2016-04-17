@@ -236,7 +236,7 @@ xfce_desktop_setup_icon_view(XfceDesktop *desktop)
                 
                 desktop_path = g_get_user_special_dir(G_USER_DIRECTORY_DESKTOP);
                 file = g_file_new_for_path(desktop_path);
-                manager = xfdesktop_file_icon_manager_new(file, desktop->priv->channel);
+                manager = xfdesktop_file_icon_manager_new(file, desktop->priv->channel, desktop->priv->gscreen);
                 g_object_unref(file);
             }
             break;

@@ -56,7 +56,8 @@ struct _XfdesktopFileIconManagerClass
 GType xfdesktop_file_icon_manager_get_type(void) G_GNUC_CONST;
 
 XfdesktopIconViewManager *xfdesktop_file_icon_manager_new(GFile *folder,
-                                                          XfconfChannel *channel);
+                                                          XfconfChannel *channel,
+                                                          GdkScreen *screen);
 
 void xfdesktop_file_icon_save(gpointer user_data);
 

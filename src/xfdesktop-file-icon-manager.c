@@ -59,6 +59,8 @@
 #include <thunarx/thunarx.h>
 #endif
 
+#include <libwnck/libwnck.h>
+
 #include "xfce-desktop.h"
 #include "xfdesktop-clipboard-manager.h"
 #include "xfdesktop-common.h"
@@ -82,6 +84,7 @@
 typedef enum
 {
     PROP0 = 0,
+    PROP_SCREEN,
     PROP_FOLDER,
     PROP_SHOW_FILESYSTEM,
     PROP_SHOW_HOME,
@@ -112,7 +115,12 @@ struct _XfdesktopFileIconManagerPrivate
     XfdesktopIconView *icon_view;
     
     GdkScreen *gscreen;
-    
+    WnckScreen *wnck_screen;
+
+    GFile *secure_folder;
+    gboolean private_desktop;
+    GFileMonitor *secure_monitor;
+
     GFile *folder;
     XfdesktopFileIcon *desktop_icon;
     GFileMonitor *monitor;
@@ -302,6 +310,14 @@ xfdesktop_file_icon_manager_class_init(XfdesktopFileIconManagerClass *klass)
                                 | G_PARAM_STATIC_NAME \
                                 | G_PARAM_STATIC_NICK \
                                 | G_PARAM_STATIC_BLURB)
+
+    g_object_class_install_property(gobject_class, PROP_SCREEN,
+                                    g_param_spec_object("screen", "GDK Screen",
+                                                        "GDK Screen this icon manager manages",
+                                                        GDK_TYPE_SCREEN,
+                                                        G_PARAM_READWRITE
+                                                        | G_PARAM_CONSTRUCT_ONLY));
+
     g_object_class_install_property(gobject_class, PROP_SHOW_FILESYSTEM,
                                     g_param_spec_boolean("show-filesystem",
                                                          "show filesystem",
@@ -395,6 +411,11 @@ xfdesktop_file_icon_manager_set_property(GObject *object,
     XfdesktopFileIconManager *fmanager = XFDESKTOP_FILE_ICON_MANAGER(object);
     
     switch(property_id) {
+        case PROP_SCREEN:
+            fmanager->priv->gscreen = g_value_peek_pointer(value);
+            fmanager->priv->wnck_screen = wnck_screen_get(gdk_screen_get_number(fmanager->priv->gscreen));
+            break;
+
         case PROP_FOLDER:
             fmanager->priv->folder = g_value_dup_object(value);
             xfdesktop_file_icon_manager_check_create_desktop_folder(fmanager->priv->folder);
@@ -456,6 +477,9 @@ xfdesktop_file_icon_manager_get_property(GObject *object,
     XfdesktopFileIconManager *fmanager = XFDESKTOP_FILE_ICON_MANAGER(object);
     
     switch(property_id) {
+        case PROP_SCREEN:
+            g_value_set_object(value, fmanager->priv->gscreen);
+
         case PROP_FOLDER:
             g_value_set_object(value, fmanager->priv->folder);
             break;
@@ -2650,6 +2674,7 @@ xfdesktop_file_icon_manager_file_changed(GFileMonitor     *monitor,
                                          GFileMonitorEvent event,
                                          gpointer          user_data)
 {
+    //TODO fix for secure_folder
     XfdesktopFileIconManager *fmanager = XFDESKTOP_FILE_ICON_MANAGER(user_data);
     XfdesktopFileIcon *icon, *moved_icon;
     GFileInfo *file_info;
@@ -2976,25 +3001,130 @@ xfdesktop_file_icon_manager_files_ready(GFileEnumerator *enumerator,
 }
 
 static void
+xfdesktop_file_icon_manager_secure_files_ready(GFileEnumerator *secure_enumerator,
+                                               GAsyncResult *result,
+                                               gpointer user_data)
+{
+    XfdesktopFileIconManager *fmanager;
+    GError *error = NULL;
+    GList *files, *l;
+
+    /* Sanity check */
+    if(user_data == NULL || !XFDESKTOP_IS_FILE_ICON_MANAGER(user_data))
+        return;
+
+    fmanager = XFDESKTOP_FILE_ICON_MANAGER(user_data);
+
+    files = g_file_enumerator_next_files_finish(secure_enumerator, result, &error);
+
+    if(!files) {
+        if(error) {
+            GtkWidget *toplevel = gtk_widget_get_toplevel(GTK_WIDGET(fmanager->priv->icon_view));
+
+            xfce_message_dialog(gtk_widget_is_toplevel(toplevel) ? GTK_WINDOW(toplevel) : NULL,
+                                _("Load Error"),
+                                GTK_STOCK_DIALOG_WARNING, 
+                                _("Failed to load the desktop folder"), error->message,
+                                GTK_STOCK_CLOSE, GTK_RESPONSE_ACCEPT, NULL);
+        }
+    } else {
+        for(l = files; l; l = l->next) {
+            const gchar *name = g_file_info_get_name(l->data);
+            GFile *file = g_file_get_child(fmanager->priv->secure_folder, name);
+            GFile *lowerlayer_file = g_file_get_child(fmanager->priv->folder, name);
+            XfdesktopFileIcon *icon;
+
+            XF_DEBUG("got a GFileInfo: %s", g_file_info_get_display_name(l->data));
+
+            /* Remove the equivalent file from the host filesystem to avoid duplicates */
+            icon = g_hash_table_lookup(fmanager->priv->icons, lowerlayer_file);
+            if (icon)
+                xfdesktop_file_icon_manager_remove_icon(fmanager, icon);
+
+            /* Add the new file */
+            xfdesktop_file_icon_manager_add_regular_icon(fmanager,
+                                                         file, l->data,
+                                                         -1, -1,
+                                                         TRUE);
+
+            g_object_unref(file);
+
+            g_object_unref(l->data);
+        }
+
+        g_list_free(files);
+
+        g_file_enumerator_next_files_async(secure_enumerator,
+                                           10, G_PRIORITY_DEFAULT, NULL,
+                                           (GAsyncReadyCallback) xfdesktop_file_icon_manager_secure_files_ready,
+                                           fmanager);
+    }
+
+    /* initialize the file monitor */
+    if(!fmanager->priv->secure_monitor) {
+        fmanager->priv->secure_monitor = g_file_monitor(fmanager->priv->secure_folder,
+                                                 G_FILE_MONITOR_SEND_MOVED,
+                                                 NULL, NULL);
+        g_signal_connect(fmanager->priv->secure_monitor, "changed",
+                         G_CALLBACK(xfdesktop_file_icon_manager_file_changed),
+                         fmanager);
+    }
+}
+
+static void
 xfdesktop_file_icon_manager_load_desktop_folder(XfdesktopFileIconManager *fmanager)
 {
-    
+    XF_DEBUG("Reloading file icons...");
+
+    /* ditch normal icons */
+    if(fmanager->priv->icons) {
+        g_hash_table_foreach_remove(fmanager->priv->icons,
+                                    (GHRFunc)xfdesktop_remove_icons_ht,
+                                    fmanager);
+    }
     if(fmanager->priv->enumerator) {
+        XF_DEBUG("Clearing previous enumerator...");
         g_object_unref(fmanager->priv->enumerator);
         fmanager->priv->enumerator = NULL;
     }
 
-    fmanager->priv->enumerator = g_file_enumerate_children(fmanager->priv->folder,
-                                                           XFDESKTOP_FILE_INFO_NAMESPACE,
-                                                           G_FILE_QUERY_INFO_NONE,
-                                                           NULL, NULL);
+    /* Process the desktop if we are not in a workspace that has a private home */
+    if (!fmanager->priv->private_desktop) {
+        XF_DEBUG("Loading standard host Desktop...");
+        fmanager->priv->enumerator = g_file_enumerate_children(fmanager->priv->folder,
+                                                               XFDESKTOP_FILE_INFO_NAMESPACE,
+                                                               G_FILE_QUERY_INFO_NONE,
+                                                               NULL, NULL);
 
-    if(fmanager->priv->enumerator) {
-        g_file_enumerator_next_files_async(fmanager->priv->enumerator,
-                                           10, G_PRIORITY_DEFAULT, NULL,
-                                           (GAsyncReadyCallback) xfdesktop_file_icon_manager_files_ready,
-                                           fmanager);
+        if(fmanager->priv->enumerator) {
+            g_file_enumerator_next_files_async(fmanager->priv->enumerator,
+                                               10, G_PRIORITY_DEFAULT, NULL,
+                                               (GAsyncReadyCallback) xfdesktop_file_icon_manager_files_ready,
+                                               fmanager);
 
+        }
+    } else {
+        XF_DEBUG("NOT loading standard host Desktop as the current workspace has a private Home...");
+    }
+
+    /* If we are in a secure workspace with an overlay, add the overlay layer's files on top of the ones already added */
+    if (fmanager->priv->secure_folder) {
+        GFileEnumerator *secure_enumerator;
+        XF_DEBUG("Loading sandbox Desktop as the current workspace uses an OverlayFS Home...");
+
+        secure_enumerator = g_file_enumerate_children(fmanager->priv->secure_folder,
+                                                               XFDESKTOP_FILE_INFO_NAMESPACE,
+                                                               G_FILE_QUERY_INFO_NONE,
+                                                               NULL, NULL);
+
+        if(secure_enumerator) {
+            g_file_enumerator_next_files_async(secure_enumerator,
+                                               10, G_PRIORITY_DEFAULT, NULL,
+                                               (GAsyncReadyCallback) xfdesktop_file_icon_manager_secure_files_ready,
+                                               fmanager);
+
+            g_object_unref(secure_enumerator);
+        }
     }
 }
 
@@ -3125,6 +3255,72 @@ xfdesktop_file_icon_manager_remove_removable_media(XfdesktopFileIconManager *fma
     }
 }
 
+static void
+workspace_changed_cb(WnckScreen *wnck_screen,
+                     WnckWorkspace *previously_active_space,
+                     gpointer user_data)
+{
+    XfdesktopFileIconManager *fmanager = XFDESKTOP_FILE_ICON_MANAGER(user_data);
+    gint n;
+    WnckWorkspace *ws;
+    gboolean had_secure_ws = FALSE;
+
+    ws = wnck_screen_get_active_workspace(fmanager->priv->wnck_screen);
+    if(!WNCK_IS_WORKSPACE(ws)) {
+        XF_DEBUG("got weird failure of wnck_screen_get_active_workspace(), bailing");
+        return;
+    }
+
+    n = wnck_workspace_get_number(ws);
+    XF_DEBUG("Changed workspace, now entering workspace %d", n);
+
+    /* Clear any cached sandboxed workspace Desktop directory */
+    if (fmanager->priv->secure_folder) {
+        XF_DEBUG("Clearing desktop from settings of previous workspace %d, which was secure", wnck_workspace_get_number(previously_active_space));
+        g_object_unref (fmanager->priv->secure_folder);
+        fmanager->priv->secure_folder = NULL;
+        fmanager->priv->private_desktop = FALSE;
+
+        /* disconnect from the secure file monitor and release it */
+        if(fmanager->priv->secure_monitor) {
+            g_signal_handlers_disconnect_by_func(fmanager->priv->secure_monitor,
+                                                 G_CALLBACK(xfdesktop_file_icon_manager_file_changed),
+                                                 fmanager);
+            g_object_unref(fmanager->priv->secure_monitor);
+            fmanager->priv->secure_monitor = NULL;
+        }
+
+        had_secure_ws = TRUE;
+    }
+
+    /* Remember the path to the secure workspace's own overlayfs files */
+    if (xfce_workspace_is_secure (n)) {
+        const gchar *home         = g_get_home_dir ();
+        GFile       *home_file    = g_file_new_for_path (home);
+        gchar       *relative     = g_file_get_relative_path (home_file, fmanager->priv->folder);
+        gchar       *priv_home    = xfce_workspace_get_path_to_home (n);
+        gchar       *secure_folder_path = relative? g_strdup_printf ("%s/%s", priv_home, relative) : g_strdup_printf ("%s/Desktop", priv_home);
+
+        XF_DEBUG("The new workspace is secure, and its private folder is %s", secure_folder_path);
+        fmanager->priv->secure_folder = g_file_new_for_path (secure_folder_path);
+        g_free (secure_folder_path);
+        g_object_unref (home_file);
+        g_free (relative);
+        g_free (priv_home);
+
+        fmanager->priv->private_desktop = xfce_workspace_has_private_home (n);
+        XF_DEBUG("The new workspace %s a private home", fmanager->priv->private_desktop? "has" : "does not have");
+
+        XF_DEBUG("Reloading file icons as the new workspace is secure");
+        xfdesktop_file_icon_manager_load_desktop_folder (fmanager);
+    }
+    /* Unsandboxed Desktop, remove the secure view */
+    else if (had_secure_ws) {
+        XF_DEBUG("Reloading file icons as the previous workspace was secure");
+        xfdesktop_file_icon_manager_load_desktop_folder (fmanager);
+    }
+}
+
 
 /* virtual functions */
 
@@ -3232,8 +3428,19 @@ xfdesktop_file_icon_manager_real_init(XfdesktopIconViewManager *manager,
     
     g_object_unref(desktop_info);
 
+
+    fmanager->priv->secure_folder = NULL;
+    fmanager->priv->private_desktop = FALSE;
+
+    wnck_screen_force_update(fmanager->priv->wnck_screen);
+    g_signal_connect(G_OBJECT(fmanager->priv->wnck_screen),
+                     "active-workspace-changed",
+                     G_CALLBACK(workspace_changed_cb), fmanager);
+
+    workspace_changed_cb(fmanager->priv->wnck_screen, NULL, fmanager);
+
     fmanager->priv->inited = TRUE;
-    
+
     return TRUE;
 }
 
@@ -3323,6 +3530,15 @@ xfdesktop_file_icon_manager_fini(XfdesktopIconViewManager *manager)
                                              fmanager);
         g_object_unref(fmanager->priv->metadata_monitor);
         fmanager->priv->metadata_monitor = NULL;
+    }
+
+    /* disconnect from the secure file monitor and release it */
+    if(fmanager->priv->secure_monitor) {
+        g_signal_handlers_disconnect_by_func(fmanager->priv->secure_monitor,
+                                             G_CALLBACK(xfdesktop_file_icon_manager_file_changed),
+                                             fmanager);
+        g_object_unref(fmanager->priv->secure_monitor);
+        fmanager->priv->secure_monitor = NULL;
     }
 
     /* remove any pending metadata changes */
@@ -3854,14 +4070,17 @@ xfdesktop_file_icon_manager_propose_drop_action(XfdesktopIconViewManager *manage
 
 XfdesktopIconViewManager *
 xfdesktop_file_icon_manager_new(GFile *folder,
-                                XfconfChannel *channel)
+                                XfconfChannel *channel,
+                                GdkScreen *gscreen)
 {
     XfdesktopFileIconManager *fmanager;
     
     g_return_val_if_fail(folder && channel, NULL);
+    g_return_val_if_fail(GDK_IS_SCREEN(gscreen), NULL);
 
     fmanager = g_object_new(XFDESKTOP_TYPE_FILE_ICON_MANAGER,
                             "folder", folder,
+                            "screen", gscreen,
                             NULL);
     fmanager->priv->channel = g_object_ref(G_OBJECT(channel));
 
