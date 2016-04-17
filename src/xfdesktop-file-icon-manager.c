@@ -2674,7 +2674,6 @@ xfdesktop_file_icon_manager_file_changed(GFileMonitor     *monitor,
                                          GFileMonitorEvent event,
                                          gpointer          user_data)
 {
-    //TODO fix for secure_folder
     XfdesktopFileIconManager *fmanager = XFDESKTOP_FILE_ICON_MANAGER(user_data);
     XfdesktopFileIcon *icon, *moved_icon;
     GFileInfo *file_info;
@@ -2727,6 +2726,38 @@ xfdesktop_file_icon_manager_file_changed(GFileMonitor     *monitor,
                 return;
             }
 
+            if (fmanager->priv->secure_folder) {
+                gchar *relative;
+                gchar *secure_desktop;
+                gchar *secure_ws_path;
+                GFile *secure_file;
+
+                relative = g_file_get_relative_path (other_file, fmanager->priv->folder);
+                if (!relative)
+                    relative = g_file_get_basename (other_file);
+
+                secure_desktop = g_file_get_path (fmanager->priv->secure_folder);
+                secure_ws_path = g_strdup_printf ("%s/%s", secure_desktop, relative);
+
+                secure_file = g_file_new_for_path (secure_ws_path);
+                g_free (relative);
+                g_free (secure_desktop);
+                g_free (secure_ws_path);
+
+                icon = g_hash_table_lookup(fmanager->priv->icons, secure_file);
+                g_object_unref (secure_file);
+
+                /* Found a version of the new file name in the secure workspace, abort */
+                if(icon) {
+                    XF_DEBUG("icon already exists in sandbox, don't show the new one");
+
+                    if(file_info)
+                        g_object_unref(file_info);
+
+                    return;
+                }
+            }
+
             if(file_info) {
                 /* Add the icon adding the row/col info */
                 icon = xfdesktop_file_icon_manager_add_regular_icon(fmanager,
@@ -2773,6 +2804,35 @@ xfdesktop_file_icon_manager_file_changed(GFileMonitor     *monitor,
             if(icon) {
                 /* Remove the old icon */
                 xfdesktop_file_icon_manager_remove_icon(fmanager, icon);
+            }
+
+            /* if the secure workspace already contains an icon with the same name, do nothing */
+            if (fmanager->priv->secure_folder) {
+                gchar *relative;
+                gchar *secure_desktop;
+                gchar *secure_ws_path;
+                GFile *secure_file;
+
+                relative = g_file_get_relative_path (file, fmanager->priv->folder);
+                if (!relative)
+                    relative = g_file_get_basename (file);
+
+                secure_desktop = g_file_get_path (fmanager->priv->secure_folder);
+                secure_ws_path = g_strdup_printf ("%s/%s", secure_desktop, relative);
+
+                secure_file = g_file_new_for_path (secure_ws_path);
+                g_free (relative);
+                g_free (secure_desktop);
+                g_free (secure_ws_path);
+
+                icon = g_hash_table_lookup(fmanager->priv->icons, secure_file);
+                g_object_unref (secure_file);
+
+                /* Found a version of the new file name in the secure workspace, abort */
+                if(icon) {
+                    XF_DEBUG("icon already exists in sandbox, don't show the new one");
+                    return;
+                }
             }
             
             file_info = g_file_query_info(file, XFDESKTOP_FILE_INFO_NAMESPACE,
